@@ -1,0 +1,88 @@
+{
+  "manifestVersion": 2,
+  "id": "cliproxyapi-usage",
+  "name": "CLIProxyAPI Usage",
+  "version": "0.1.0",
+  "description": "Token and request usage of your CLIProxyAPI server per model and account, in a sidebar panel and the status bar.",
+  "license": "MIT",
+  "author": {
+    "name": "aNNdii",
+    "url": "https://github.com/aNNdii"
+  },
+  "repository": "https://github.com/aNNdii/orca-cliproxyapi-usage",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "usage",
+        "title": "CLIProxyAPI",
+        "icon": "gauge",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "cliproxyapi.summary",
+        "title": "CLIProxyAPI: Show today's usage"
+      },
+      {
+        "id": "cliproxyapi.refresh",
+        "title": "CLIProxyAPI: Refresh usage now"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "usage",
+        "text": "CPA",
+        "icon": "gauge",
+        "tooltip": "CLIProxyAPI usage",
+        "command": "cliproxyapi.summary"
+      }
+    ],
+    "settings": [
+      {
+        "key": "baseUrl",
+        "title": "CLIProxyAPI URL",
+        "description": "Base URL of the CLIProxyAPI server, without /v1 or /v8/management. https:// for remote servers (plain http:// only for localhost); remote servers also need management.allow-remote: true. The management key is sent only to the server it was saved for.",
+        "type": "string",
+        "default": "http://127.0.0.1:8317",
+        "placeholder": "https://cliproxy.example.com"
+      },
+      {
+        "key": "pollSeconds",
+        "title": "Poll interval (seconds)",
+        "description": "How often the usage queue is read. Keep it below the server's usage queue retention (observability.usage.redis-usage-queue-retention-seconds, 60 seconds by default), or records expire unread.",
+        "type": "integer",
+        "default": 15,
+        "minimum": 5,
+        "maximum": 300
+      },
+      {
+        "key": "retentionDays",
+        "title": "Days of history to keep",
+        "description": "Local calendar days kept, today included. A longer range in the panel shows only these days.",
+        "type": "integer",
+        "default": 31,
+        "minimum": 1,
+        "maximum": 366
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "secrets:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ]
+}
