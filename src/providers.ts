@@ -12,7 +12,7 @@ import { cleanText, get, isRecord, json, list, number } from './untrusted'
 import { PLUGIN_VERSION } from './version'
 
 /** The User-Agent of every upstream quota request. Honest on purpose: it names this plugin. */
-export const USER_AGENT = `orca-cliproxyapi-usage/${PLUGIN_VERSION}`
+export const USER_AGENT = `orca-cliproxyapi-quota/${PLUGIN_VERSION}`
 
 /** One rate-limit window of one account. */
 export type Window = {

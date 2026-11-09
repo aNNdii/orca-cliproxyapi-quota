@@ -1,6 +1,6 @@
 {
   "manifestVersion": 2,
-  "id": "cliproxyapi-usage",
+  "id": "cliproxyapi-quota",
   "name": "CLIProxyAPI Quota",
   "version": "0.2.0",
   "description": "Remaining subscription quota of every Claude, Codex and Antigravity account behind your CLIProxyAPI server: percent used and reset time per window, in a sidebar panel and the status bar.",
@@ -9,7 +9,7 @@
     "name": "aNNdii",
     "url": "https://github.com/aNNdii"
   },
-  "repository": "https://github.com/aNNdii/orca-cliproxyapi-usage",
+  "repository": "https://github.com/aNNdii/orca-cliproxyapi-quota",
   "engines": {
     "orca": ">=1.4.248"
   },
@@ -19,7 +19,7 @@
   "contributes": {
     "panels": [
       {
-        "id": "usage",
+        "id": "quota",
         "title": "CLIProxyAPI",
         "icon": "gauge",
         "entry": "src/panel.tsx",
@@ -38,7 +38,7 @@
     ],
     "statusBarItems": [
       {
-        "id": "usage",
+        "id": "quota",
         "text": "CPA",
         "icon": "gauge",
         "tooltip": "CLIProxyAPI quota",
@@ -66,9 +66,6 @@
     ]
   },
   "capabilities": [
-    {
-      "kind": "storage:own"
-    },
     {
       "kind": "secrets:own"
     },

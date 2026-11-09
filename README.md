@@ -50,7 +50,7 @@ Usage statistics on the server are not needed; the plugin no longer reads the us
 From Git, pinned to a release:
 
 ```sh
-orca plugin install https://github.com/aNNdii/orca-cliproxyapi-usage#v0.2.0
+orca plugin install https://github.com/aNNdii/orca-cliproxyapi-quota#v0.2.0
 ```
 
 The plugin runs its own worker, so this first exits with `approval_required` and prints what the
@@ -60,9 +60,9 @@ then run the same command with `--approve <fingerprint>`.
 From a checkout: Settings → Plugins → Install → Local folder, or `orca plugin dev watch .` while
 developing.
 
-Upgrading from 0.1: the token counting is gone. The plugin deletes the usage counts 0.1 stored
-(plugin storage key `usage`) when it starts, and the **Days of history to keep** setting no longer
-exists. The management key stays.
+Upgrading from 0.1: version 0.1 counted tokens and was published as `cliproxyapi-usage` from
+`aNNdii/orca-cliproxyapi-usage`. This plugin replaces it under a new id, so Orca installs it next to
+the old one: uninstall **CLIProxyAPI Usage**, then set the URL and enter the management key again.
 
 ## Use
 
@@ -116,7 +116,7 @@ A rest holds even when the poll that learnt it failed as a whole later on.
   request body, letters, digits and `._:-` only). A value that does not match is dropped.
 - **The key itself is checked.** Only keys of printable ASCII characters without spaces, at most
   512 of them, are saved, so a key can never break or extend the `Authorization` header.
-- **Honest User-Agent.** Upstream quota requests carry `User-Agent: orca-cliproxyapi-usage/0.2.0`;
+- **Honest User-Agent.** Upstream quota requests carry `User-Agent: orca-cliproxyapi-quota/0.2.0`;
   the plugin does not pretend to be Claude Code, Codex or Antigravity. If a provider refuses the
   request for that reason, the account shows the refusal (for example "upstream 403").
 - **Unverified:** whether Anthropic, OpenAI or Google mind periodic quota checks from a

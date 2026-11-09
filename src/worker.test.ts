@@ -147,7 +147,7 @@ test('the status bar shows the tightest window and lists every account in the to
   const { worker } = await mount(host)
   await refresh(worker)
   const bar = lastBar(host)
-  assert.equal(bar.id, 'usage')
+  assert.equal(bar.id, 'quota')
   assert.match(bar.text, /^Claude 5h 62% · \d\d:\d\d$/)
   assert.equal(bar.tone, 'neutral')
   assert.deepEqual(bar.tooltip.split('\n'), [
@@ -634,13 +634,11 @@ test('forgetting the key stops polling and forgets the accounts', async () => {
   assert.equal(cpa.requests.length, sent)
 })
 
-test('the poll interval is clamped to 60..3600 seconds, and the old usage counts are deleted', async () => {
+test('the poll interval is clamped to 60..3600 seconds', async () => {
   serve(fakeServer())
-  const host = withKey({ settings: { baseUrl: ORIGIN, pollSeconds: 5 }, storage: { usage: { days: {} }, other: 1 } })
+  const host = withKey({ settings: { baseUrl: ORIGIN, pollSeconds: 5 } })
   const { worker, orca } = await mount(host)
   assert.equal((await refresh(worker)).pollSeconds, 60)
-  assert.equal('usage' in host.data().storage, false, 'the 0.1 usage counts are gone')
-  assert.equal(host.data().storage.other, 1, 'nothing else is touched')
   await orca.settings.set('pollSeconds', 99_999)
   assert.equal((await refresh(worker)).pollSeconds, 3600)
 })

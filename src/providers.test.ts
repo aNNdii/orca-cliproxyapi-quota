@@ -495,5 +495,5 @@ test('cleanText trims, strips unprintable characters and caps', () => {
 
 test('the User-Agent names this plugin at the manifest\'s version', () => {
   assert.equal(PLUGIN_VERSION, manifest.version)
-  assert.equal(USER_AGENT, `orca-cliproxyapi-usage/${manifest.version}`)
+  assert.equal(USER_AGENT, `orca-cliproxyapi-quota/${manifest.version}`)
 })

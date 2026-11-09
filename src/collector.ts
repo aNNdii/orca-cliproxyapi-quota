@@ -61,8 +61,6 @@ export function pollDeadlineMs(pollSeconds: number): number {
   return Math.max(SLOWEST_READ_MS + DEADLINE_MARGIN_MS, Math.min(pollSeconds * 1000, MAX_POLL_MS))
 }
 
-/** Plugin storage key of the usage counts version 0.1 kept; deleted on start. */
-const LEGACY_STORE_KEY = 'usage'
 const POLL = { default: 300, min: 60, max: 3600 }
 const REST_MS: Record<Rest, number> = { 'rate-limited': RATE_LIMIT_REST_MS, refused: REFUSED_REST_MS }
 
@@ -140,17 +138,11 @@ export class Collector {
   }
 
   /**
-   * Starts working: follows settings changes from now on, deletes the usage counts version 0.1
-   * stored (they mean nothing to the quota view), then starts the first poll without waiting for
-   * it. Never rejects.
+   * Starts working: follows settings changes from now on, then starts the first poll without
+   * waiting for it. Never rejects.
    */
   async start(): Promise<void> {
     this.settingsSubscription = this.orca.settings.onDidChange(() => void this.refresh({ fresh: true }))
-    try {
-      if ((await this.orca.storage.keys()).includes(LEGACY_STORE_KEY)) await this.orca.storage.delete(LEGACY_STORE_KEY)
-    } catch (error) {
-      this.orca.log(`could not delete the old usage counts: ${message(error)}`)
-    }
     void this.refresh()
   }
 
@@ -419,7 +411,7 @@ export class Collector {
     if (this.orca.host.has('statusBar.update')) {
       try {
         const item = statusBarItem(this.overview(), this.clock.now())
-        await this.orca.host.call('statusBar.update', { id: 'usage', icon: 'gauge', ...item })
+        await this.orca.host.call('statusBar.update', { id: 'quota', icon: 'gauge', ...item })
       } catch (error) {
         this.orca.log(`status bar update failed: ${message(error)}`)
       }
