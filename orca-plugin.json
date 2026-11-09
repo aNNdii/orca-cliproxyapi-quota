@@ -1,9 +1,9 @@
 {
   "manifestVersion": 2,
   "id": "cliproxyapi-usage",
-  "name": "CLIProxyAPI Usage",
-  "version": "0.1.0",
-  "description": "Token and request usage of your CLIProxyAPI server per model and account, in a sidebar panel and the status bar.",
+  "name": "CLIProxyAPI Quota",
+  "version": "0.2.0",
+  "description": "Remaining subscription quota of every Claude, Codex and Antigravity account behind your CLIProxyAPI server: percent used and reset time per window, in a sidebar panel and the status bar.",
   "license": "MIT",
   "author": {
     "name": "aNNdii",
@@ -28,12 +28,12 @@
     ],
     "commands": [
       {
-        "id": "cliproxyapi.summary",
-        "title": "CLIProxyAPI: Show today's usage"
+        "id": "cliproxyapi.quota",
+        "title": "CLIProxyAPI: Show quota"
       },
       {
         "id": "cliproxyapi.refresh",
-        "title": "CLIProxyAPI: Refresh usage now"
+        "title": "CLIProxyAPI: Refresh quota now"
       }
     ],
     "statusBarItems": [
@@ -41,8 +41,8 @@
         "id": "usage",
         "text": "CPA",
         "icon": "gauge",
-        "tooltip": "CLIProxyAPI usage",
-        "command": "cliproxyapi.summary"
+        "tooltip": "CLIProxyAPI quota",
+        "command": "cliproxyapi.quota"
       }
     ],
     "settings": [
@@ -57,20 +57,11 @@
       {
         "key": "pollSeconds",
         "title": "Poll interval (seconds)",
-        "description": "How often the usage queue is read. Keep it below the server's usage queue retention (observability.usage.redis-usage-queue-retention-seconds, 60 seconds by default), or records expire unread.",
+        "description": "How often the quota of every account is read, through CLIProxyAPI. Each read sends one quota request per enabled account; Antigravity accounts may try up to three hosts, and Claude accounts also ask for their plan until it is known. An account rests for 15 minutes after its provider answers 429, and for 30 minutes after it refuses the account (401 or 403). A poll starts no new read after its interval (but never before 4 minutes, and at most 5); accounts it did not get to are read first in the next poll.",
         "type": "integer",
-        "default": 15,
-        "minimum": 5,
-        "maximum": 300
-      },
-      {
-        "key": "retentionDays",
-        "title": "Days of history to keep",
-        "description": "Local calendar days kept, today included. A longer range in the panel shows only these days.",
-        "type": "integer",
-        "default": 31,
-        "minimum": 1,
-        "maximum": 366
+        "default": 300,
+        "minimum": 60,
+        "maximum": 3600
       }
     ]
   },

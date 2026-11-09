@@ -1,265 +1,438 @@
-// The collector owns everything that changes over time: the poll timer, the poll in flight, what
-// is known about the server and key (refused, banned), the counted usage, and telling the status
-// bar and open panels. src/worker.ts only connects Orca's handlers to it.
-import type { JsonValue, OrcaWorkerApi } from 'orca/worker'
-import { ClientError, CpaClient, type FetchLike, normalizeBaseUrl } from './client'
-import type { StatusKind, StatusTone, UsageState } from './protocol'
-import { allViews, compact, emptyStore, ingest, readStore, STORE_KEY, type UsageStore, viewFor } from './usage'
+// The collector owns everything that changes over time: the poll timer, the poll in flight and its
+// time budget, what is known about the server (its ban), the last good quota of every account and
+// when each may be asked again, and telling the status bar and open panels. The key lives in
+// src/keystore.ts, how anything reads (status labels, messages) in src/format.ts; src/worker.ts
+// only connects Orca's handlers to it.
+import type { OrcaWorkerApi } from 'orca/worker'
+import type { Account } from './accounts'
+import { API_CALL_TIMEOUT_MS, ClientError, CpaClient, type FetchLike, MANAGEMENT_TIMEOUT_MS, normalizeBaseUrl } from './client'
+import { MESSAGES, type Overview, statusBarItem, summaryText } from './format'
+import { KeyStore, type StoredKey } from './keystore'
+import { type AccountView, fitState, type QuotaState, type StatusKind } from './protocol'
+import {
+  hasQuota,
+  MAX_REQUESTS_PER_READ,
+  type Plan,
+  providerName,
+  type QuotaResult,
+  readQuota,
+  type Rest,
+  type Window
+} from './providers'
+
+/** Where the collector gets the time from, and how it waits. Tests pass one they can move. */
+export type Clock = {
+  /** Epoch ms. */
+  now(): number
+  /** Runs `task` once after `ms` milliseconds; the returned function cancels it. */
+  after(ms: number, task: () => void): () => void
+}
+
+export const systemClock: Clock = {
+  now: () => Date.now(),
+  after: (ms, task) => {
+    const timer = setTimeout(task, ms)
+    return () => clearTimeout(timer)
+  }
+}
+
+/** Accounts read at the same time. */
+export const CONCURRENCY = 3
+/** How long an account rests after its provider rate-limited it (429). */
+export const RATE_LIMIT_REST_MS = 15 * 60 * 1000
+/** How long an account rests after its provider refused its token or the request (401, 403). */
+export const REFUSED_REST_MS = 30 * 60 * 1000
+/** The longest one account read can take: every request `readQuota` may send, each to its timeout. */
+export const SLOWEST_READ_MS = MAX_REQUESTS_PER_READ * API_CALL_TIMEOUT_MS
+/** A poll's deadline is at most this long after it began, unless the slowest read needs longer. */
+export const MAX_POLL_MS = 5 * 60 * 1000
+/** Time for the credential list, and to spare, on top of the slowest read. */
+const DEADLINE_MARGIN_MS = MANAGEMENT_TIMEOUT_MS + 10_000
 
 /**
- * Secret holding the key as JSON `{ origin, key, refused? }`. The key is only ever sent to the
- * origin (scheme, host and port) it was saved for; `refused: true` marks a key the server refused,
- * so it is not sent again, not even after a restart, until a key is saved anew.
+ * When a poll stops starting account reads, in ms after it began: after its interval (at most
+ * `MAX_POLL_MS`), but never before the slowest read could have ended, so one slow account cannot
+ * keep the others from being read. Reads already running at the deadline end on their own,
+ * bounded by the client's timeouts; the poll then shows what it read, and the accounts it did not
+ * get to keep their last numbers, say so (`AccountView.missed`) and go first in the next poll. A
+ * credential list still pending at the deadline is stopped, which fails the poll.
  */
-export const KEY_SECRET = 'managementKey'
-
-const PAGE_SIZE = 500
-/** Pages per poll; whatever is left waits for the next poll. */
-const MAX_PAGES = 20
-const DEFAULTS = { pollSeconds: 15, retentionDays: 31 }
-
-const MESSAGES = {
-  enterKey: 'Enter the CLIProxyAPI management key in the panel.',
-  keyRefused:
-    'The server refused the management key. Polling is paused until you save a key again (CLIProxyAPI bans an IP for about 30 minutes after 5 failed attempts).'
+export function pollDeadlineMs(pollSeconds: number): number {
+  return Math.max(SLOWEST_READ_MS + DEADLINE_MARGIN_MS, Math.min(pollSeconds * 1000, MAX_POLL_MS))
 }
 
-const STATUS: Record<StatusKind, { tone: StatusTone; label: string }> = {
-  unconfigured: { tone: 'neutral', label: 'not set up' },
-  ok: { tone: 'success', label: 'connected' },
-  auth: { tone: 'danger', label: 'key refused' },
-  error: { tone: 'warning', label: 'error' }
+/** Plugin storage key of the usage counts version 0.1 kept; deleted on start. */
+const LEGACY_STORE_KEY = 'usage'
+const POLL = { default: 300, min: 60, max: 3600 }
+const REST_MS: Record<Rest, number> = { 'rate-limited': RATE_LIMIT_REST_MS, refused: REFUSED_REST_MS }
+
+type Settings = { baseUrl: string | null; urlError: string | null; pollSeconds: number }
+
+/** What the collector remembers of one account between polls. */
+type Memory = {
+  plan: Plan
+  windows: Window[]
+  notes: string[]
+  error: string | null
+  updatedAt: number | null
+  /** Not asked before `until` (epoch ms); a manual refresh ignores a `refused` rest. */
+  rest: { until: number; reason: Rest } | null
+  /** When a read of this account last ended (epoch ms); the longest unread go first. */
+  readAt: number | null
+  /** The last poll was due to read it but stopped first. */
+  missed: boolean
 }
 
-type Settings = { baseUrl: string | null; urlError: string | null; pollSeconds: number; retentionDays: number }
-type Credentials = { origin: string; key: string; refused?: true }
+/**
+ * The one rule for which accounts are read: only `readable` ones are. The others are shown, and
+ * say why they are not read.
+ */
+function classify(account: Account): 'disabled' | 'unsupported' | 'no-auth-index' | 'readable' {
+  if (account.disabled) return 'disabled'
+  if (!hasQuota(account.provider)) return 'unsupported'
+  if (account.authIndex === null) return 'no-auth-index'
+  return 'readable'
+}
 
-const clamp = (value: JsonValue | undefined, fallback: number, min: number, max: number) =>
+const clamp = (value: unknown, fallback: number, min: number, max: number) =>
   typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
 const invalid = (text: string) => Object.assign(new Error(text), { code: 'invalid_params' })
 
 export class Collector {
-  private status: UsageState['status'] = { kind: 'unconfigured', ...STATUS.unconfigured, message: null }
+  private status: QuotaState['status'] = { kind: 'unconfigured', message: null }
   private lastPollAt: number | null = null
-  /** Reused while URL and key stay the same, so the API version it found stays cached. */
+  private accounts: AccountView[] = []
+  private omitted = 0
+  /** By account id; only accounts of the current server and key. Replaced as a whole by each poll. */
+  private memory = new Map<string, Memory>()
+  /**
+   * Reused while URL and key stay the same, so the API version it found stays cached. A poll
+   * whose client is no longer this one was overtaken (the key was saved or forgotten meanwhile)
+   * and changes nothing.
+   */
   private client: CpaClient | null = null
   /** The server banned this computer's IP: nothing goes to `origin` before `until` (epoch ms). */
-  private ban: { origin: string; until: number } | null = null
+  private ban: { origin: string; until: number; reason: string } | null = null
+  /** Stops the poll in flight when the key changes under it. */
+  private pollAbort: AbortController | null = null
   private running: Promise<void> | null = null
-  /** A fresh poll waiting for `running` to end; fresh callers arriving meanwhile share it. */
+  /** Whether `running` is a manual poll, which also asks accounts resting after a 401 or 403. */
+  private runningManual = false
+  /** A poll waiting for `running` to end; callers arriving meanwhile share it. */
   private next: Promise<void> | null = null
-  private timer: ReturnType<typeof setTimeout> | null = null
+  /** Whether `next` is to be manual: a caller asked for that while `running` was not. */
+  private nextManual = false
+  private cancelTimer: (() => void) | null = null
   /** Rises with every schedule(), so a schedule that awaited settings can tell it was superseded. */
   private timerGeneration = 0
-  /** Secret writes run one after another, so marking a key refused never overwrites a newer key. */
-  private secretWrites: Promise<unknown> = Promise.resolve()
+  private settingsSubscription: { dispose(): void } | null = null
+  private readonly keys: KeyStore
   private readonly abort = new AbortController()
   private stopped = false
 
-  private constructor(
+  constructor(
     private readonly orca: OrcaWorkerApi,
     private readonly fetch: FetchLike,
-    private store: UsageStore
-  ) {}
-
-  static async open(orca: OrcaWorkerApi, fetch: FetchLike): Promise<Collector> {
-    return new Collector(orca, fetch, readStore(await orca.storage.get(STORE_KEY)))
+    private readonly clock: Clock = systemClock
+  ) {
+    this.keys = new KeyStore(orca.secrets)
   }
 
   /**
-   * Polls, tells the status bar and open panels, then schedules the next poll. Without `fresh`, a
-   * caller arriving while a poll runs shares it; with `fresh` (after a new key or settings) it gets
-   * a poll that starts after the running one ends and so reads the new configuration. Never rejects.
+   * Starts working: follows settings changes from now on, deletes the usage counts version 0.1
+   * stored (they mean nothing to the quota view), then starts the first poll without waiting for
+   * it. Never rejects.
    */
-  refresh(options: { fresh?: boolean } = {}): Promise<void> {
+  async start(): Promise<void> {
+    this.settingsSubscription = this.orca.settings.onDidChange(() => void this.refresh({ fresh: true }))
+    try {
+      if ((await this.orca.storage.keys()).includes(LEGACY_STORE_KEY)) await this.orca.storage.delete(LEGACY_STORE_KEY)
+    } catch (error) {
+      this.orca.log(`could not delete the old usage counts: ${message(error)}`)
+    }
+    void this.refresh()
+  }
+
+  /**
+   * Polls, tells the status bar and open panels, then schedules the next poll. A caller arriving
+   * while a poll runs shares it, unless that poll does not do what it asks: with `fresh` (after a
+   * new key or settings) it gets a poll that starts after the running one ends and so reads the
+   * new configuration; `manual` (the person asked) also asks accounts resting after an upstream
+   * 401 or 403, so a manual caller arriving during another poll gets one more, manual, poll after
+   * it. Such callers share that one poll. Never rejects.
+   */
+  refresh(options: { fresh?: boolean; manual?: boolean } = {}): Promise<void> {
     if (this.stopped) return Promise.resolve()
-    if (!this.running) return this.start()
-    if (!options.fresh) return this.running
+    const manual = options.manual === true
+    if (!this.running) return this.startPoll(manual)
+    if (!options.fresh && !(manual && !this.runningManual)) return this.running
+    this.nextManual ||= manual
     this.next ??= this.running.then(() => {
+      const nextManual = this.nextManual
       this.next = null
-      return this.refresh()
+      this.nextManual = false
+      return this.refresh({ manual: nextManual })
     })
     return this.next
   }
 
-  /** The plugin settings changed: poll with them now and reschedule with the new interval. */
-  reconfigure(): Promise<void> {
-    return this.refresh({ fresh: true })
-  }
-
-  /** Stores `key` for the origin of the configured URL and polls with it. Rejects with `invalid_params`. */
+  /**
+   * Stores `key` for the origin of the configured URL and starts a poll with it, without waiting
+   * for that poll. Rejects with `invalid_params` for a missing URL or a malformed key.
+   */
   async saveKey(key: string): Promise<void> {
     const { baseUrl, urlError } = await this.settings()
-    if (!baseUrl) throw invalid(urlError ?? 'Set the CLIProxyAPI URL first.')
-    const trimmed = key.trim()
-    if (!trimmed) throw invalid('The management key is empty.')
-    const credentials: Credentials = { origin: new URL(baseUrl).origin, key: trimmed }
-    await this.serially(() => this.orca.secrets.set(KEY_SECRET, JSON.stringify(credentials)))
-    await this.refresh({ fresh: true })
+    if (!baseUrl) throw invalid(urlError ?? MESSAGES.setUrlFirst)
+    await this.keys.save(new URL(baseUrl).origin, key)
+    this.restart('connecting', null)
   }
 
+  /** Forgets the stored key and everything read with it. */
   async clearKey(): Promise<void> {
-    await this.serially(() => this.orca.secrets.delete(KEY_SECRET))
-    this.client = null
-    await this.refresh({ fresh: true })
+    await this.keys.clear()
+    this.restart('unconfigured', MESSAGES.enterKey)
   }
 
-  /** Deletes the counted usage and starts counting anew. */
-  async reset(): Promise<void> {
-    this.store = emptyStore()
-    await this.orca.storage.set(STORE_KEY, this.store as unknown as JsonValue)
-    await this.publish()
-  }
-
-  async state(): Promise<UsageState> {
+  /** The state for the panel, within `STATE_BUDGET_BYTES`. */
+  async state(): Promise<QuotaState> {
     const settings = await this.settings()
     const origin = settings.baseUrl ? new URL(settings.baseUrl).origin : null
-    return {
+    return fitState({
       baseUrl: settings.baseUrl,
-      hasKey: origin !== null && (await this.storedCredentials())?.origin === origin,
-      status: this.status,
-      lastPollAt: this.lastPollAt,
-      trackingSince: this.store.since,
+      hasKey: origin !== null && (await this.keys.read())?.origin === origin,
+      ...this.overview(),
+      polling: this.running !== null,
       apiVersion: this.client?.version ?? null,
-      statisticsEnabled: this.client?.statisticsEnabled ?? null,
-      retentionDays: settings.retentionDays,
-      views: allViews(this.store, Date.now())
-    }
+      pollSeconds: settings.pollSeconds
+    })
   }
 
-  /** Today's usage as a few lines of text, for the status bar tooltip and the summary command. */
+  /** One line per account with its windows and resets, for the quota command. */
   summary(): string {
-    const today = viewFor(this.store, Date.now(), 'today')
-    const { totals } = today
-    const lines = [
-      `CLIProxyAPI today: ${totals.requests} requests (${totals.failed} failed), ${compact(totals.total)} tokens`,
-      `in ${compact(totals.input)} · out ${compact(totals.output)} · cached ${compact(totals.cached)} · reasoning ${compact(totals.reasoning)}`
-    ]
-    const top = today.models[0]
-    if (top) lines.push(`Top model: ${top.key} (${compact(top.totals.total)} tokens)`)
-    if (this.status.kind !== 'ok' && this.status.message) lines.push(this.status.message)
-    return lines.join('\n')
+    return summaryText(this.overview(), this.clock.now())
   }
 
   /** Cancels the timer and the requests in flight, and waits for the running poll to end. */
   async stop(): Promise<void> {
     this.stopped = true
     this.timerGeneration += 1
-    if (this.timer) clearTimeout(this.timer)
-    this.timer = null
+    this.settingsSubscription?.dispose()
+    this.cancelTimer?.()
+    this.cancelTimer = null
     this.abort.abort()
     await (this.next ?? this.running)
   }
 
-  private start(): Promise<void> {
-    const run = this.pollOnce()
-      .then(() => this.publish())
+  private overview(): Overview {
+    return { status: this.status, accounts: this.accounts, omitted: this.omitted, lastPollAt: this.lastPollAt }
+  }
+
+  /** The key changed: drop what the old one read, say so at once, and poll with the new one. */
+  private restart(kind: StatusKind, text: string | null): void {
+    this.pollAbort?.abort(new Error('The management key changed.'))
+    this.forgetServer()
+    this.setStatus(kind, text)
+    void this.publish()
+    void this.refresh({ fresh: true })
+  }
+
+  private startPoll(manual: boolean): Promise<void> {
+    this.runningManual = manual
+    const run = this.pollOnce(manual)
       .catch((error: unknown) => this.orca.log(`poll error: ${message(error)}`))
-      .finally(() => {
+      .then(() => {
         this.running = null
-        void this.schedule()
+        return this.publish()
       })
+      .finally(() => void this.schedule())
     this.running = run
     return run
   }
 
   private async schedule(): Promise<void> {
     const generation = ++this.timerGeneration
-    if (this.timer) clearTimeout(this.timer)
-    this.timer = null
+    this.cancelTimer?.()
+    this.cancelTimer = null
     const { pollSeconds } = await this.settings()
     if (this.stopped || generation !== this.timerGeneration) return
-    this.timer = setTimeout(() => {
-      this.timer = null
+    this.cancelTimer = this.clock.after(pollSeconds * 1000, () => {
+      this.cancelTimer = null
       void this.refresh()
-    }, pollSeconds * 1000)
+    })
   }
 
-  private async pollOnce(): Promise<void> {
+  private async pollOnce(manual: boolean): Promise<void> {
     const settings = await this.settings()
-    if (!settings.baseUrl) return this.setStatus('unconfigured', settings.urlError)
-    const origin = new URL(settings.baseUrl).origin
-    const credentials = await this.storedCredentials()
-    if (!credentials || credentials.origin !== origin) {
-      return this.setStatus(
-        'unconfigured',
-        credentials
-          ? `The stored key is for ${credentials.origin}. Enter the management key for ${origin}.`
-          : MESSAGES.enterKey
-      )
+    const stored = await this.keys.read()
+    const origin = settings.baseUrl ? new URL(settings.baseUrl).origin : null
+    // What was read belongs to one URL and key; any other, or none, starts from nothing.
+    const key = stored?.origin === origin ? stored.key : null
+    if (!settings.baseUrl || key === null || !this.client?.matches(settings.baseUrl, key)) this.forgetServer()
+    if (!settings.baseUrl || origin === null) return this.setStatus('unconfigured', settings.urlError)
+    if (!stored || stored.origin !== origin) {
+      return this.setStatus('unconfigured', stored ? MESSAGES.keyForOtherOrigin(stored.origin, origin) : MESSAGES.enterKey)
     }
-    if (credentials.refused) return this.setStatus('auth', MESSAGES.keyRefused)
-    if (this.ban && this.ban.origin === origin && Date.now() < this.ban.until) return
-    if (!this.client?.matches(settings.baseUrl, credentials.key)) {
-      this.client = new CpaClient(settings.baseUrl, credentials.key, this.fetch)
+    if (stored.refused) return this.setStatus('auth', MESSAGES.keyRefused)
+    if (this.ban && this.ban.origin === origin && this.clock.now() < this.ban.until) {
+      return this.setStatus('error', MESSAGES.pausedUntil(this.ban.reason, this.ban.until, this.clock.now()))
     }
+    this.client ??= new CpaClient(settings.baseUrl, stored.key, this.fetch)
     const client = this.client
+    const pollAbort = new AbortController()
+    this.pollAbort = pollAbort
+    const signal = AbortSignal.any([this.abort.signal, pollAbort.signal])
+    const deadlineMs = pollDeadlineMs(settings.pollSeconds)
+    const listingAbort = new AbortController()
+    let pastDeadline = false
+    const cancelDeadline = this.clock.after(deadlineMs, () => {
+      pastDeadline = true
+      listingAbort.abort(new ClientError(MESSAGES.pollTooSlow(deadlineMs)))
+    })
     try {
-      for (let page = 0; page < MAX_PAGES && !this.stopped; page++) {
-        const records = await client.pop(PAGE_SIZE, this.abort.signal)
-        // Saved before asking for the next page: the server has already dropped these records.
-        if (ingest(this.store, records, Date.now(), settings.retentionDays)) {
-          await this.orca.storage.set(STORE_KEY, this.store as unknown as JsonValue)
-        }
-        if (records.length < PAGE_SIZE) break
-      }
+      const { accounts, omitted } = await client.listAccounts(AbortSignal.any([signal, listingAbort.signal]))
+      const fatal = await this.readAccounts(client, accounts, signal, manual, () => pastDeadline)
+      if (this.client !== client) return
+      this.omitted = omitted
+      if (fatal) throw fatal.error
       this.setStatus('ok', null)
     } catch (error) {
-      if (this.stopped) return
-      const failure = error instanceof ClientError ? error : new ClientError(message(error))
-      this.orca.log(`poll failed: ${failure.message}`)
-      if (failure.pause === 'until-key-changes') {
-        // A key saved while this poll ran is not the one refused; its own poll follows.
-        if (await this.markRefused(credentials)) this.setStatus('auth', MESSAGES.keyRefused)
-        return
-      }
-      if (failure.pause === 'until-time' && failure.retryAt !== null) this.ban = { origin, until: failure.retryAt }
-      this.setStatus('error', failure.message)
+      if (!this.stopped) await this.fail(error, stored, client)
     } finally {
-      this.lastPollAt = Date.now()
+      cancelDeadline()
+      if (this.pollAbort === pollAbort) this.pollAbort = null
+      if (this.client === client && !this.stopped) this.lastPollAt = this.clock.now()
     }
   }
 
+  /** The poll with `client` and `used` failed as a whole: remember a ban or refusal, and say so. */
+  private async fail(error: unknown, used: StoredKey, client: CpaClient): Promise<void> {
+    const failure = error instanceof ClientError ? error : new ClientError(message(error))
+    // A ban is of this computer's IP, whichever key was sent.
+    if (failure.pause.kind === 'banned') {
+      const until = this.clock.now() + failure.pause.retryAfterMs
+      this.ban = { origin: new URL(client.baseUrl).origin, until, reason: failure.message }
+      if (this.client === client) this.setStatus('error', MESSAGES.pausedUntil(failure.message, until, this.clock.now()))
+      return
+    }
+    if (failure.pause.kind === 'key-refused') return this.refuse(used, client)
+    if (this.client !== client) return
+    this.orca.log(`poll failed: ${failure.message}`)
+    this.setStatus('error', failure.message)
+  }
+
+  /**
+   * Reads every account that is `readable` and not resting, `CONCURRENCY` at a time, the longest
+   * unread first, until `pastDeadline()`; then rebuilds the account views in the server's order.
+   * A failure of one account stays on that account; a failure that concerns every account (the
+   * key refused, a ban, the poll stopped) stops the other reads and is handed back. What was read
+   * is kept either way, rests included, unless `client` was replaced meanwhile: then these
+   * accounts belong to a key no longer in use, and nothing changes.
+   */
+  private async readAccounts(
+    client: CpaClient,
+    listed: Account[],
+    signal: AbortSignal,
+    manual: boolean,
+    pastDeadline: () => boolean
+  ): Promise<{ error: unknown } | null> {
+    // Copies, so a poll that is overtaken leaves `this.memory` as it was.
+    const memory = new Map<string, Memory>()
+    for (const account of listed) {
+      memory.set(account.id, { ...(this.memory.get(account.id) ?? blankMemory()), missed: false })
+    }
+    const now = this.clock.now()
+    const due = listed
+      .filter((account) => classify(account) === 'readable' && !resting(memory.get(account.id)!, now, manual))
+      .sort((a, b) => (memory.get(a.id)!.readAt ?? -Infinity) - (memory.get(b.id)!.readAt ?? -Infinity))
+    const stopReads = new AbortController()
+    const lanesSignal = AbortSignal.any([signal, stopReads.signal])
+    let fatal: { error: unknown } | null = null
+    const lane = async () => {
+      while (!fatal && !pastDeadline()) {
+        const account = due.shift()
+        if (!account) return
+        const remembered = memory.get(account.id)!
+        const authIndex = account.authIndex!
+        try {
+          const result = await readQuota(account, (request) => client.apiCall(authIndex, request, lanesSignal), {
+            now: this.clock.now(),
+            plan: remembered.plan
+          })
+          this.remember(remembered, account, result)
+        } catch (error) {
+          remembered.missed = true
+          fatal ??= { error }
+          stopReads.abort()
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: CONCURRENCY }, lane))
+    for (const account of due) memory.get(account.id)!.missed = true
+    if (this.client !== client) return fatal
+    this.memory = memory
+    this.accounts = listed.map((account) => view(account, memory.get(account.id)!))
+    return fatal
+  }
+
+  private remember(memory: Memory, account: Account, result: QuotaResult): void {
+    const now = this.clock.now()
+    memory.readAt = now
+    memory.rest = result.rest ? { until: now + REST_MS[result.rest], reason: result.rest } : null
+    const name = `${providerName(account.provider)} account ${account.id.slice(0, 40)}`
+    const restText = memory.rest ? MESSAGES.restsUntil(memory.rest.reason, memory.rest.until, now) : ''
+    if (result.ok) {
+      Object.assign(memory, { plan: result.plan, windows: result.windows, notes: result.notes, error: null, updatedAt: now })
+      if (memory.rest) this.orca.log(`${name}: the plan lookup was rate-limited. ${restText}`)
+      return
+    }
+    memory.error = memory.rest ? `${result.error} ${restText}` : result.error
+    this.orca.log(`${name}: ${memory.error}`)
+  }
+
+  /**
+   * The server refused `used`. The key store counts it refused at once, even if storing that
+   * fails; the status says so unless a newer key replaced it meanwhile.
+   */
+  private async refuse(used: StoredKey, client: CpaClient): Promise<void> {
+    let current = true
+    try {
+      current = await this.keys.markRefused(used)
+    } catch (error) {
+      this.orca.log(`could not store that the key was refused: ${message(error)}`)
+    }
+    if (current && this.client === client) this.setStatus('auth', MESSAGES.keyRefused)
+  }
+
+  /** Drops everything learnt from the previous server or key. */
+  private forgetServer(): void {
+    this.client = null
+    this.accounts = []
+    this.omitted = 0
+    this.lastPollAt = null
+    this.memory = new Map()
+  }
+
+  /** Updates the status bar, then posts the state to open panels. Never rejects. */
   private async publish(): Promise<void> {
     if (this.stopped) return
-    this.orca.panels.post('cpa.changed', await this.state())
-    if (!this.orca.host.has('statusBar.update')) return
-    const today = viewFor(this.store, Date.now(), 'today').totals
-    const unconfigured = this.status.kind === 'unconfigured'
+    if (this.orca.host.has('statusBar.update')) {
+      try {
+        const item = statusBarItem(this.overview(), this.clock.now())
+        await this.orca.host.call('statusBar.update', { id: 'usage', icon: 'gauge', ...item })
+      } catch (error) {
+        this.orca.log(`status bar update failed: ${message(error)}`)
+      }
+    }
     try {
-      await this.orca.host.call('statusBar.update', {
-        id: 'usage',
-        icon: 'gauge',
-        text: unconfigured ? 'CPA: set up' : `CPA ${compact(today.total)}`,
-        // Green would mark every healthy poll; the status bar only draws attention to problems.
-        tone: this.status.kind === 'ok' ? 'neutral' : this.status.tone,
-        tooltip: unconfigured ? `CLIProxyAPI usage: ${this.status.message ?? MESSAGES.enterKey}` : this.summary()
-      })
+      this.orca.panels.post('cpa.changed', await this.state())
     } catch (error) {
-      this.orca.log(`status bar update failed: ${message(error)}`)
+      this.orca.log(`posting to the panels failed: ${message(error)}`)
     }
   }
 
   private setStatus(kind: StatusKind, text: string | null): void {
-    this.status = { kind, ...STATUS[kind], message: text }
-  }
-
-  private serially<T>(write: () => Promise<T>): Promise<T> {
-    const result = this.secretWrites.then(write)
-    this.secretWrites = result.catch(() => undefined)
-    return result
-  }
-
-  /** Marks `used` refused if it is still the stored key; returns whether it was. */
-  private markRefused(used: Credentials): Promise<boolean> {
-    return this.serially(async () => {
-      const stored = await this.storedCredentials()
-      if (!stored || stored.origin !== used.origin || stored.key !== used.key) return false
-      const refused: Credentials = { origin: stored.origin, key: stored.key, refused: true }
-      await this.orca.secrets.set(KEY_SECRET, JSON.stringify(refused))
-      return true
-    })
+    this.status = { kind, message: text }
   }
 
   private async settings(): Promise<Settings> {
@@ -271,26 +444,50 @@ export class Collector {
     } catch (error) {
       urlError = message(error)
     }
-    return {
-      baseUrl,
-      urlError,
-      pollSeconds: clamp(values.pollSeconds, DEFAULTS.pollSeconds, 5, 300),
-      retentionDays: clamp(values.retentionDays, DEFAULTS.retentionDays, 1, 366)
-    }
+    return { baseUrl, urlError, pollSeconds: clamp(values.pollSeconds, POLL.default, POLL.min, POLL.max) }
   }
+}
 
-  /** The stored key; null when none is stored or the secret is not in the `{ origin, key }` form. */
-  private async storedCredentials(): Promise<Credentials | null> {
-    const raw = await this.orca.secrets.get(KEY_SECRET)
-    if (!raw) return null
-    try {
-      const value = JSON.parse(raw) as Partial<Credentials> | null
-      if (!value || typeof value.origin !== 'string' || typeof value.key !== 'string' || !value.key) return null
-      return value.refused === true
-        ? { origin: value.origin, key: value.key, refused: true }
-        : { origin: value.origin, key: value.key }
-    } catch {
-      return null
-    }
+const blankMemory = (): Memory => ({
+  plan: undefined,
+  windows: [],
+  notes: [],
+  error: null,
+  updatedAt: null,
+  rest: null,
+  readAt: null,
+  missed: false
+})
+
+function resting(memory: Memory, now: number, manual: boolean): boolean {
+  if (!memory.rest || memory.rest.until <= now) return false
+  return !(manual && memory.rest.reason === 'refused')
+}
+
+function view(account: Account, memory: Memory): AccountView {
+  const base = {
+    id: account.id,
+    provider: providerName(account.provider),
+    title: account.email ?? account.label ?? account.name,
+    plan: memory.plan ?? null
+  }
+  const empty = { windows: [], notes: [], error: null, updatedAt: null, missed: false }
+  switch (classify(account)) {
+    case 'disabled':
+      return { ...base, kind: 'disabled', ...empty }
+    case 'unsupported':
+      return { ...base, kind: 'unsupported', ...empty }
+    case 'no-auth-index':
+      return { ...base, kind: 'quota', ...empty, error: MESSAGES.noAuthIndex }
+    case 'readable':
+      return {
+        ...base,
+        kind: 'quota',
+        windows: memory.windows,
+        notes: memory.notes,
+        error: memory.error,
+        updatedAt: memory.updatedAt,
+        missed: memory.missed
+      }
   }
 }
